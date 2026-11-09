@@ -1,0 +1,634 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Branch-based banking deployment platform and its nested application.
+
+# Upload this file directly in CloudFormation once for dev and once for main.
+# CodeBuild subsequently updates this same parent stack from the selected branch.
+Parameters:
+  ProjectName:
+    Type: String
+    Default: bank-dev
+    AllowedPattern: '[a-z][a-z0-9-]{2,23}'
+    Description: Unique resource prefix in this account and region, such as bank-dev.
+  DeploymentBranch:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, main]
+  GitHubRepository:
+    Type: String
+    AllowedPattern: '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+'
+    Description: GitHub owner/repository, without a URL or .git suffix.
+  NotificationEmail:
+    Type: String
+    AllowedPattern: '[^\s@]+@[^\s@]+\.[^\s@]+'
+  BedrockModelId:
+    Type: String
+    Default: amazon.nova-pro-v1:0
+    Description: Model ID or inference profile supporting Converse tool use and 8000 output tokens in this region.
+  ApplicationTemplateKey:
+    Type: String
+    Default: ''
+    Description: Leave empty at first creation. CodeBuild sets the packaged template key.
+  SourceCommit:
+    Type: String
+    Default: ''
+    Description: Leave empty at first creation. CodePipeline supplies the Git commit.
+
+Conditions:
+  HasApplication: !Not [!Equals [!Ref ApplicationTemplateKey, '']]
+
+Resources:
+  # The platform owns its artifacts, so deleting this parent removes its own releases.
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      VersioningConfiguration: {Status: Enabled}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      OwnershipControls:
+        Rules: [{ObjectOwnership: BucketOwnerEnforced}]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt ArtifactBucket.Arn
+              - !Sub '${ArtifactBucket.Arn}/*'
+            Condition: {Bool: {'aws:SecureTransport': 'false'}}
+
+  # Complete the GitHub authorization in the Connections console after creation.
+  GitHubConnection:
+    Type: AWS::CodeConnections::Connection
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      ConnectionName: !Sub '${ProjectName}-github'
+      ProviderType: GitHub
+  GitHubSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Description: GitHub token used only by the repair agent. Edit token after creation.
+      SecretString: '{"token":""}'
+
+  # CloudFormation needs provisioning permissions to create and delete both stacks.
+  # Keep this deployment role separate from the narrowly scoped runtime roles.
+  StackExecutionRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: cloudformation.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ProvisionProjectServices
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:*
+                  - iam:*
+                  - s3:*
+                  - lambda:*
+                  - logs:*
+                  - glue:*
+                  - states:*
+                  - sns:*
+                  - athena:*
+                  - secretsmanager:*
+                  - codebuild:*
+                  - codepipeline:*
+                  - codeconnections:*
+                Resource: '*'
+  DeploymentLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/banking/${ProjectName}/deploy'
+      RetentionInDays: 7
+  BuildRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: codebuild.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DeployNestedApplication
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt DeploymentLogGroup.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub '${ArtifactBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - cloudformation:UpdateStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:GetTemplate
+                Resource: !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}*/*'
+              - Effect: Allow
+                Action: cloudformation:ValidateTemplate
+                Resource: '*'
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt StackExecutionRole.Arn
+              - Effect: Allow
+                Action: states:ListExecutions
+                Resource: !Sub 'arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-daily'
+              - Effect: Allow
+                Action: glue:GetJobRuns
+                Resource: !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:job/${ProjectName}-*'
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub '${ProjectName}-deploy'
+      ServiceRole: !GetAtt BuildRole.Arn
+      TimeoutInMinutes: 45
+      ConcurrentBuildLimit: 1
+      Source: {Type: CODEPIPELINE, BuildSpec: buildspec.yml}
+      Artifacts: {Type: CODEPIPELINE}
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        EnvironmentVariables:
+          - {Name: ROOT_STACK_NAME, Value: !Ref 'AWS::StackName'}
+          - {Name: ARTIFACT_BUCKET, Value: !Ref ArtifactBucket}
+          - {Name: STACK_ROLE_ARN, Value: !GetAtt StackExecutionRole.Arn}
+      LogsConfig:
+        CloudWatchLogs: {Status: ENABLED, GroupName: !Ref DeploymentLogGroup}
+  PipelineRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: codepipeline.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FetchBranchAndBuild
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: codeconnections:UseConnection
+                Resource: !GetAtt GitHubConnection.ConnectionArn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:GetBucketVersioning
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub '${ArtifactBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource: !GetAtt BuildProject.Arn
+  DeploymentPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub '${ProjectName}-deploy'
+      PipelineType: V2
+      ExecutionMode: QUEUED
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore: {Type: S3, Location: !Ref ArtifactBucket}
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: GitHub
+              Namespace: SourceVariables
+              ActionTypeId: {Category: Source, Owner: AWS, Provider: CodeStarSourceConnection, Version: '1'}
+              Configuration:
+                ConnectionArn: !GetAtt GitHubConnection.ConnectionArn
+                FullRepositoryId: !Ref GitHubRepository
+                BranchName: !Ref DeploymentBranch
+                DetectChanges: 'true'
+                OutputArtifactFormat: CODE_ZIP
+              OutputArtifacts: [{Name: SourceCode}]
+              RunOrder: 1
+        - Name: Deploy
+          Actions:
+            - Name: BuildAndDeploy
+              ActionTypeId: {Category: Build, Owner: AWS, Provider: CodeBuild, Version: '1'}
+              Configuration:
+                ProjectName: !Ref BuildProject
+                EnvironmentVariables: '[{"name":"SOURCE_COMMIT","value":"#{SourceVariables.CommitId}","type":"PLAINTEXT"}]'
+              InputArtifacts: [{Name: SourceCode}]
+              RunOrder: 1
+
+  # The child remains owned by this parent. Delete the parent to remove both layers.
+  Application:
+    Type: AWS::CloudFormation::Stack
+    Condition: HasApplication
+    DependsOn: StackExecutionRole
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TemplateURL: !Sub 'https://${ArtifactBucket}.s3.${AWS::Region}.${AWS::URLSuffix}/${ApplicationTemplateKey}'
+      TimeoutInMinutes: 25
+      Parameters:
+        ProjectName: !Ref ProjectName
+        DeploymentBranch: !Ref DeploymentBranch
+        GitHubRepository: !Ref GitHubRepository
+        GitHubSecretArn: !Ref GitHubSecret
+        NotificationEmail: !Ref NotificationEmail
+        BedrockModelId: !Ref BedrockModelId
+        ArtifactBucket: !Ref ArtifactBucket
+        SourceCommit: !Ref SourceCommit
+
+  PlatformCleanupLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-platform-cleanup'
+      RetentionInDays: 7
+  PlatformCleanupRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EmptyOwnedArtifacts
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt PlatformCleanupLogGroup.Arn
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                  - s3:ListBucketMultipartUploads
+                  - s3:DeleteObject
+                  - s3:DeleteObjectVersion
+                  - s3:AbortMultipartUpload
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub '${ArtifactBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - codepipeline:DisableStageTransition
+                  - codepipeline:ListPipelineExecutions
+                  - codepipeline:StopPipelineExecution
+                Resource: !Sub 'arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:${DeploymentPipeline}'
+              - Effect: Allow
+                Action:
+                  - codebuild:ListBuildsForProject
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StopBuild
+                Resource:
+                  - !GetAtt BuildProject.Arn
+                  - !Sub 'arn:${AWS::Partition}:codebuild:${AWS::Region}:${AWS::AccountId}:build/${BuildProject}:*'
+  PlatformCleanupFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: PlatformCleanupLogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      FunctionName: !Sub '${ProjectName}-platform-cleanup'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 900
+      MemorySize: 256
+      Role: !GetAtt PlatformCleanupRole.Arn
+      # The checked-in inline copy makes this template directly console-deployable.
+      # scripts/deploy.py refreshes it from infra/cleanup.py on later deployments.
+      Code:
+        ZipFile: |
+          # INLINE_CLEANUP_START
+          """CloudFormation deletion hook: stop writers and remove only stack-owned data."""
+
+          import json
+          import time
+          from urllib.request import Request, urlopen
+
+          import boto3
+          from botocore.exceptions import ClientError
+
+
+          def remaining(context):
+              """Leave enough time to report a failure instead of timing out silently."""
+              if context.get_remaining_time_in_millis() < 45000:
+                  raise TimeoutError(
+                      "Cleanup needs another attempt. Retry Delete on the parent stack."
+                  )
+
+
+          def optional_call(client, operation, **arguments):
+              """Allow deletion to resume when an earlier attempt already removed a resource."""
+              try:
+                  return getattr(client, operation)(**arguments)
+              except ClientError as error:
+                  code = error.response["Error"]["Code"]
+                  if code in {
+                      "EntityNotFoundException",
+                      "ResourceNotFoundException",
+                      "PipelineNotFoundException",
+                      "StateMachineDoesNotExist",
+                      "NoSuchBucket",
+                      "404",
+                  }:
+                      return {}
+                  raise
+
+
+          def stop_deployments(properties, context):
+              """Stop active pipeline executions and wait for their CodeBuild processes."""
+              if properties.get("PipelineName"):
+                  pipeline = boto3.client("codepipeline")
+                  # Incoming transitions are disabled before active executions are stopped.
+                  optional_call(
+                      pipeline,
+                      "disable_stage_transition",
+                      pipelineName=properties["PipelineName"],
+                      stageName="Deploy",
+                      transitionType="Inbound",
+                      reason="CloudFormation stack deletion",
+                  )
+                  for page in pipeline.get_paginator("list_pipeline_executions").paginate(
+                      pipelineName=properties["PipelineName"]
+                  ):
+                      for execution in page["pipelineExecutionSummaries"]:
+                          if execution["status"] in {"InProgress", "Stopping"}:
+                              try:
+                                  pipeline.stop_pipeline_execution(
+                                      pipelineName=properties["PipelineName"],
+                                      pipelineExecutionId=execution["pipelineExecutionId"],
+                                      abandon=True,
+                                      reason="Stack deletion",
+                                  )
+                              except ClientError as error:
+                                  if error.response["Error"]["Code"] not in {
+                                      "PipelineExecutionNotStoppableException",
+                                      "DuplicatedStopRequestException",
+                                  }:
+                                      raise
+
+              if properties.get("BuildProject"):
+                  build = boto3.client("codebuild")
+                  ids = []
+                  for page in build.get_paginator("list_builds_for_project").paginate(
+                      projectName=properties["BuildProject"]
+                  ):
+                      ids.extend(page["ids"])
+                  for offset in range(0, len(ids), 100):
+                      for item in build.batch_get_builds(ids=ids[offset : offset + 100])[
+                          "builds"
+                      ]:
+                          if item["buildStatus"] == "IN_PROGRESS":
+                              build.stop_build(id=item["id"])
+                              while (
+                                  build.batch_get_builds(ids=[item["id"]])["builds"][0][
+                                      "buildStatus"
+                                  ]
+                                  == "IN_PROGRESS"
+                              ):
+                                  remaining(context)
+                                  time.sleep(3)
+
+
+          def stop_data_jobs(properties, context):
+              """Stop workflow executions, Glue jobs, and Athena queries before emptying S3."""
+              if properties.get("StateMachineArn"):
+                  states = boto3.client("stepfunctions")
+                  for page in states.get_paginator("list_executions").paginate(
+                      stateMachineArn=properties["StateMachineArn"], statusFilter="RUNNING"
+                  ):
+                      for execution in page["executions"]:
+                          states.stop_execution(
+                              executionArn=execution["executionArn"], cause="Stack deletion"
+                          )
+
+              glue = boto3.client("glue")
+              for name in properties.get("Jobs", []):
+                  active = []
+                  for page in glue.get_paginator("get_job_runs").paginate(JobName=name):
+                      active.extend(
+                          run["Id"]
+                          for run in page["JobRuns"]
+                          if run["JobRunState"] in {"STARTING", "RUNNING", "STOPPING", "WAITING"}
+                      )
+                  for offset in range(0, len(active), 25):
+                      glue.batch_stop_job_run(
+                          JobName=name, JobRunIds=active[offset : offset + 25]
+                      )
+                  for run_id in active:
+                      while glue.get_job_run(JobName=name, RunId=run_id)["JobRun"][
+                          "JobRunState"
+                      ] in {"STARTING", "RUNNING", "STOPPING", "WAITING"}:
+                          remaining(context)
+                          time.sleep(3)
+
+              if properties.get("WorkGroup"):
+                  athena = boto3.client("athena")
+                  for page in athena.get_paginator("list_query_executions").paginate(
+                      WorkGroup=properties["WorkGroup"]
+                  ):
+                      for query_id in page["QueryExecutionIds"]:
+                          state = athena.get_query_execution(QueryExecutionId=query_id)[
+                              "QueryExecution"
+                          ]["Status"]["State"]
+                          if state in {"QUEUED", "RUNNING"}:
+                              athena.stop_query_execution(QueryExecutionId=query_id)
+                              while athena.get_query_execution(QueryExecutionId=query_id)[
+                                  "QueryExecution"
+                              ]["Status"]["State"] in {"QUEUED", "RUNNING"}:
+                                  remaining(context)
+                                  time.sleep(2)
+
+
+          def remove_tables(database):
+              """Remove job-created Iceberg tables and Athena views from this database only."""
+              glue = boto3.client("glue")
+              names = []
+              for page in glue.get_paginator("get_tables").paginate(DatabaseName=database):
+                  names.extend(table["Name"] for table in page["TableList"])
+              for offset in range(0, len(names), 100):
+                  response = glue.batch_delete_table(
+                      DatabaseName=database, TablesToDelete=names[offset : offset + 100]
+                  )
+                  if response.get("Errors"):
+                      raise RuntimeError("Some catalog tables could not be deleted")
+
+
+          def empty_bucket(bucket, context):
+              """Delete all object versions, delete markers, and unfinished multipart uploads."""
+              s3 = boto3.client("s3")
+              for page in s3.get_paginator("list_multipart_uploads").paginate(Bucket=bucket):
+                  for upload in page.get("Uploads", []):
+                      s3.abort_multipart_upload(
+                          Bucket=bucket, Key=upload["Key"], UploadId=upload["UploadId"]
+                      )
+
+              # A versioned bucket is not empty when a normal delete merely adds a marker.
+              # Delete each version and marker explicitly, checking per-object errors.
+              for page in s3.get_paginator("list_object_versions").paginate(Bucket=bucket):
+                  remaining(context)
+                  items = page.get("Versions", []) + page.get("DeleteMarkers", [])
+                  for offset in range(0, len(items), 1000):
+                      response = s3.delete_objects(
+                          Bucket=bucket,
+                          Delete={
+                              "Objects": [
+                                  {"Key": item["Key"], "VersionId": item["VersionId"]}
+                                  for item in items[offset : offset + 1000]
+                              ],
+                              "Quiet": True,
+                          },
+                      )
+                      if response.get("Errors"):
+                          raise RuntimeError(
+                              "S3 rejected deletion of one or more object versions"
+                          )
+
+              # Also cover buckets whose versioning was never enabled or was suspended.
+              for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket):
+                  remaining(context)
+                  objects = [{"Key": item["Key"]} for item in page.get("Contents", [])]
+                  if objects:
+                      response = s3.delete_objects(
+                          Bucket=bucket, Delete={"Objects": objects, "Quiet": True}
+                      )
+                      if response.get("Errors"):
+                          raise RuntimeError("S3 rejected deletion of one or more objects")
+
+
+          def handler(event, context):
+              """Acknowledge every CloudFormation request, including cleanup failures."""
+              properties = event["ResourceProperties"]
+              status, reason = "SUCCESS", "Cleanup completed"
+              try:
+                  # Create and Update do not clear data. Cleanup runs only for Delete requests.
+                  if event["RequestType"] == "Delete":
+                      stop_deployments(properties, context)
+                      stop_data_jobs(properties, context)
+                      if properties.get("Database"):
+                          remove_tables(properties["Database"])
+                      empty_bucket(properties["Bucket"], context)
+              except Exception as error:
+                  status, reason = "FAILED", f"{type(error).__name__}: {error}"
+                  print(reason)
+
+              # The response URL is supplied by CloudFormation. Do not log it: it is signed.
+              body = json.dumps(
+                  {
+                      "Status": status,
+                      "Reason": reason[:1000],
+                      "PhysicalResourceId": event.get(
+                          "PhysicalResourceId", f"cleanup-{properties['Bucket']}"
+                      ),
+                      "StackId": event["StackId"],
+                      "RequestId": event["RequestId"],
+                      "LogicalResourceId": event["LogicalResourceId"],
+                      "Data": {},
+                  }
+              ).encode()
+              request = Request(
+                  event["ResponseURL"],
+                  data=body,
+                  method="PUT",
+                  headers={"Content-Type": "", "Content-Length": str(len(body))},
+              )
+              with urlopen(request, timeout=20) as response:
+                  response.read()
+          # INLINE_CLEANUP_END
+  PlatformCleanup:
+    Type: Custom::EmptyProjectArtifacts
+    DependsOn: ArtifactBucketPolicy
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      ServiceToken: !GetAtt PlatformCleanupFunction.Arn
+      ServiceTimeout: 950
+      Bucket: !Ref ArtifactBucket
+      PipelineName: !Ref DeploymentPipeline
+      BuildProject: !Ref BuildProject
+      # The conditional reference keeps the child alive until this hook finishes.
+      ApplicationStack: !If [HasApplication, !Ref Application, !Ref 'AWS::NoValue']
+
+Outputs:
+  DeploymentPipelineName:
+    Value: !Ref DeploymentPipeline
+  GitHubConnectionArn:
+    Value: !GetAtt GitHubConnection.ConnectionArn
+  GitHubSecretArn:
+    Value: !Ref GitHubSecret
+  ArtifactBucketName:
+    Value: !Ref ArtifactBucket
+  ApplicationStackId:
+    Condition: HasApplication
+    Value: !Ref Application
+  DataBucketName:
+    Condition: HasApplication
+    Value: !GetAtt Application.Outputs.DataBucketName
+  StateMachineArn:
+    Condition: HasApplication
+    Value: !GetAtt Application.Outputs.StateMachineArn
+  DatabaseName:
+    Condition: HasApplication
+    Value: !GetAtt Application.Outputs.DatabaseName
+  AthenaWorkGroup:
+    Condition: HasApplication
+    Value: !GetAtt Application.Outputs.AthenaWorkGroup

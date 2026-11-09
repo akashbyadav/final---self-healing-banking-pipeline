@@ -1,0 +1,30 @@
+{
+  "batches": [
+    {
+      "batch_date": "2026-10-28",
+      "new_transactions": 3000,
+      "successful_transactions": 2727,
+      "successful_amount_inr": "6728851.15",
+      "cumulative_transactions": 3000,
+      "cumulative_customer_versions": 1000
+    },
+    {
+      "batch_date": "2026-10-29",
+      "new_transactions": 3500,
+      "successful_transactions": 3181,
+      "successful_amount_inr": "7891915.59",
+      "cumulative_transactions": 6500,
+      "cumulative_customer_versions": 1100
+    },
+    {
+      "batch_date": "2026-10-30",
+      "new_transactions": 3500,
+      "successful_transactions": 3181,
+      "successful_amount_inr": "7920901.77",
+      "cumulative_transactions": 10000,
+      "cumulative_customer_versions": 1200
+    }
+  ],
+  "total_transactions": 10000,
+  "total_customer_versions": 1200
+}

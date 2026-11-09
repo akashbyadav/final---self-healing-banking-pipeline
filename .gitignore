@@ -1,0 +1,13 @@
+# Keep local environments and deployment artifacts out of the repository.
+# The small synthetic data/generated dataset is included so inputs are visible.
+.venv/
+__pycache__/
+.ruff_cache/
+*.py[cod]
+.DS_Store
+.build/
+infra/.generated-*.yaml
+.release.json
+.env
+*.pem
+

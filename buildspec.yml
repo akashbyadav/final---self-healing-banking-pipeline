@@ -1,0 +1,19 @@
+# CodePipeline supplies the branch commit and the parent-stack settings.
+version: 0.2
+phases:
+  install:
+    runtime-versions:
+      python: '3.12'
+    commands:
+      - pip install -r requirements.txt
+  pre_build:
+    commands:
+      # Syntax parsing does not import Spark, run jobs, or execute generated code.
+      - python -c "import ast, pathlib; [ast.parse(p.read_text()) for d in ('jobs', 'agent', 'infra', 'scripts') for p in pathlib.Path(d).glob('*.py')]"
+      - aws cloudformation validate-template --template-body file://infra/platform.yaml > /dev/null
+      - aws cloudformation validate-template --template-body file://infra/application.yaml > /dev/null
+  build:
+    commands:
+      # Deploy code and infrastructure. Source CSVs are uploaded manually in S3.
+      - python scripts/deploy.py
+

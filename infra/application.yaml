@@ -1,0 +1,528 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Banking SCD2 processing, incident repair, and deletion cleanup.
+
+# CodeBuild uploads the two Lambda ZIP archives before deploying this nested stack.
+Parameters:
+  ProjectName: {Type: String}
+  DeploymentBranch: {Type: String, AllowedValues: [dev, main]}
+  GitHubRepository: {Type: String}
+  GitHubSecretArn: {Type: String}
+  NotificationEmail: {Type: String}
+  BedrockModelId:
+    Type: String
+    Description: Model or inference profile supporting Converse tool use and 8000 output tokens.
+  ArtifactBucket: {Type: String}
+  SourceCommit: {Type: String}
+
+Resources:
+  DataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub '${ProjectName}-${AWS::AccountId}-${AWS::Region}-data'
+      VersioningConfiguration: {Status: Enabled}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      OwnershipControls:
+        Rules: [{ObjectOwnership: BucketOwnerEnforced}]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+  DataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Bucket: !Ref DataBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt DataBucket.Arn
+              - !Sub '${DataBucket.Arn}/*'
+            Condition: {Bool: {'aws:SecureTransport': 'false'}}
+  Database:
+    Type: AWS::Glue::Database
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Join ['_', !Split ['-', !Ref ProjectName]]
+        Description: Customer history and transactions for this environment only.
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub '${ProjectName}-analytics'
+      RecursiveDeleteOption: true
+      State: ENABLED
+      WorkGroupConfiguration:
+        EngineVersion: {SelectedEngineVersion: Athena engine version 3}
+        EnforceWorkGroupConfiguration: true
+        BytesScannedCutoffPerQuery: 1073741824
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${DataBucket}/query-results/'
+          EncryptionConfiguration: {EncryptionOption: SSE_S3}
+  Notifications:
+    Type: AWS::SNS::Topic
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TopicName: !Sub '${ProjectName}-incidents'
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TopicArn: !Ref Notifications
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # All application log groups are declared explicitly so stack deletion owns them.
+  GlueErrorLogs:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties: {LogGroupName: !Sub '/banking/${ProjectName}/glue/error', RetentionInDays: 7}
+  GlueOutputLogs:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties: {LogGroupName: !Sub '/banking/${ProjectName}/glue/output', RetentionInDays: 7}
+  AgentLogs:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties: {LogGroupName: !Sub '/aws/lambda/${ProjectName}-repair', RetentionInDays: 7}
+  CleanupLogs:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties: {LogGroupName: !Sub '/aws/lambda/${ProjectName}-app-cleanup', RetentionInDays: 7}
+
+  GlueRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: glue.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ProcessOwnedBankingData
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                  - s3:AbortMultipartUpload
+                Resource:
+                  - !GetAtt DataBucket.Arn
+                  - !Sub '${DataBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucket}'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/releases/*'
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:DeleteTable
+                  - glue:GetTableVersion
+                  - glue:GetTableVersions
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${Database}'
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${Database}/*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !GetAtt GlueErrorLogs.Arn
+                  - !GetAtt GlueOutputLogs.Arn
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: '*'
+
+  # Two small Spark jobs expose the two processing stages in Step Functions.
+  CustomerJob:
+    Type: AWS::Glue::Job
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub '${ProjectName}-customers'
+      Role: !GetAtt GlueRole.Arn
+      GlueVersion: '5.0'
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      Timeout: 10
+      MaxRetries: 0
+      ExecutionProperty: {MaxConcurrentRuns: 1}
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Sub 's3://${ArtifactBucket}/releases/${SourceCommit}/jobs/customer_history.py'
+      DefaultArguments:
+        '--bucket': !Ref DataBucket
+        '--database': !Ref Database
+        '--source_commit': !Ref SourceCommit
+        '--datalake-formats': iceberg
+        '--job-bookmark-option': job-bookmark-disable
+        '--enable-job-insights': 'false'
+        '--enable-spark-ui': 'false'
+        '--custom-logGroup-prefix': !Sub '/banking/${ProjectName}/glue'
+        '--TempDir': !Sub 's3://${DataBucket}/temporary/'
+        '--conf': !Sub >-
+          spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
+          --conf spark.sql.catalog.glue_catalog=org.apache.iceberg.spark.SparkCatalog
+          --conf spark.sql.catalog.glue_catalog.warehouse=s3://${DataBucket}/warehouse/
+          --conf spark.sql.catalog.glue_catalog.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog
+          --conf spark.sql.catalog.glue_catalog.io-impl=org.apache.iceberg.aws.s3.S3FileIO
+  TransactionJob:
+    Type: AWS::Glue::Job
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub '${ProjectName}-transactions'
+      Role: !GetAtt GlueRole.Arn
+      GlueVersion: '5.0'
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      Timeout: 10
+      MaxRetries: 0
+      ExecutionProperty: {MaxConcurrentRuns: 1}
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Sub 's3://${ArtifactBucket}/releases/${SourceCommit}/jobs/transactions.py'
+      DefaultArguments:
+        '--bucket': !Ref DataBucket
+        '--database': !Ref Database
+        '--source_commit': !Ref SourceCommit
+        '--datalake-formats': iceberg
+        '--job-bookmark-option': job-bookmark-disable
+        '--enable-job-insights': 'false'
+        '--enable-spark-ui': 'false'
+        '--custom-logGroup-prefix': !Sub '/banking/${ProjectName}/glue'
+        '--TempDir': !Sub 's3://${DataBucket}/temporary/'
+        '--conf': !Sub >-
+          spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
+          --conf spark.sql.catalog.glue_catalog=org.apache.iceberg.spark.SparkCatalog
+          --conf spark.sql.catalog.glue_catalog.warehouse=s3://${DataBucket}/warehouse/
+          --conf spark.sql.catalog.glue_catalog.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog
+          --conf spark.sql.catalog.glue_catalog.io-impl=org.apache.iceberg.aws.s3.S3FileIO
+
+  AgentRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DiagnoseAndNotify
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt AgentLogs.Arn
+              - Effect: Allow
+                Action: logs:GetLogEvents
+                Resource:
+                  - !GetAtt GlueErrorLogs.Arn
+                  - !GetAtt GlueOutputLogs.Arn
+              - Effect: Allow
+                Action: glue:GetJobRuns
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:job/${CustomerJob}'
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:job/${TransactionJob}'
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub '${DataBucket.Arn}/raw/*'
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref GitHubSecretArn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref Notifications
+              # Wildcard supports either a direct model or a regional inference profile.
+              - Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: '*'
+  RepairAgent:
+    Type: AWS::Lambda::Function
+    DependsOn: AgentLogs
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      FunctionName: !Sub '${ProjectName}-repair'
+      Description: Bounded Bedrock tool-use loop; proposes a repair PR or sends an SNS diagnosis.
+      Runtime: python3.12
+      Handler: handler.handler
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Sub 'releases/${SourceCommit}/agent.zip'
+      # The handler limits model/tool calls and checks remaining time before work.
+      # This is the outer runtime limit; it does not authorize longer agent loops.
+      Timeout: 900
+      MemorySize: 512
+      Role: !GetAtt AgentRole.Arn
+      Environment:
+        Variables:
+          TOPIC_ARN: !Ref Notifications
+          MODEL_ID: !Ref BedrockModelId
+          DATA_BUCKET: !Ref DataBucket
+          GLUE_LOG_PREFIX: !Sub '/banking/${ProjectName}/glue'
+          GITHUB_REPOSITORY: !Ref GitHubRepository
+          GITHUB_SECRET_ARN: !Ref GitHubSecretArn
+          SOURCE_BRANCH: !Ref DeploymentBranch
+          SOURCE_COMMIT: !Ref SourceCommit
+
+  WorkflowRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: states.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: RunJobsAndHandleFailures
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                  - glue:GetJobRuns
+                  - glue:BatchStopJobRun
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:job/${CustomerJob}'
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:job/${TransactionJob}'
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt RepairAgent.Arn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref Notifications
+  DailyWorkflow:
+    Type: AWS::StepFunctions::StateMachine
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      StateMachineName: !Sub '${ProjectName}-daily'
+      StateMachineType: STANDARD
+      RoleArn: !GetAtt WorkflowRole.Arn
+      Definition:
+        Comment: Ordered banking batch. A repair PR does not mark a failed batch successful.
+        StartAt: CustomerHistory
+        States:
+          CustomerHistory:
+            Type: Task
+            Resource: arn:aws:states:::glue:startJobRun.sync
+            Parameters:
+              JobName: !Ref CustomerJob
+              Arguments:
+                '--input_key.$': $.customers_key
+                '--batch_date.$': $.batch_date
+                '--execution_id.$': $$.Execution.Id
+                # Explicit run arguments are visible in GetJobRuns; job defaults
+                # alone are not a reliable record of the revision that executed.
+                '--source_commit': !Ref SourceCommit
+            ResultPath: $.customer_job
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.failure
+                Next: CustomerIncident
+            Next: Transactions
+          Transactions:
+            Type: Task
+            Resource: arn:aws:states:::glue:startJobRun.sync
+            Parameters:
+              JobName: !Ref TransactionJob
+              Arguments:
+                '--input_key.$': $.transactions_key
+                '--batch_date.$': $.batch_date
+                '--execution_id.$': $$.Execution.Id
+                '--source_commit': !Ref SourceCommit
+            ResultPath: $.transaction_job
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.failure
+                Next: TransactionIncident
+            Next: Completed
+          CustomerIncident:
+            Type: Pass
+            Parameters:
+              job_kind: customers
+              job_name: !Ref CustomerJob
+              input_key.$: $.customers_key
+              execution_id.$: $$.Execution.Id
+              failure.$: $.failure
+            Next: Diagnose
+          TransactionIncident:
+            Type: Pass
+            Parameters:
+              job_kind: transactions
+              job_name: !Ref TransactionJob
+              input_key.$: $.transactions_key
+              execution_id.$: $$.Execution.Id
+              failure.$: $.failure
+            Next: Diagnose
+          Diagnose:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: !GetAtt RepairAgent.Arn
+              Payload.$: $
+            ResultPath: $.diagnosis
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.agent_failure
+                Next: AgentFailureNotification
+            Next: ProcessingFailed
+          AgentFailureNotification:
+            Type: Task
+            Resource: arn:aws:states:::sns:publish
+            Parameters:
+              TopicArn: !Ref Notifications
+              Subject: Banking repair agent failed
+              Message.$: States.JsonToString($)
+            Next: ProcessingFailed
+          ProcessingFailed:
+            Type: Fail
+            Error: BankingBatchFailed
+            Cause: Processing failed. Review the incident, deploy any approved repair, then rerun.
+          Completed: {Type: Succeed}
+
+  CleanupRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: RemoveOwnedApplicationData
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt CleanupLogs.Arn
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                  - s3:ListBucketMultipartUploads
+                  - s3:DeleteObject
+                  - s3:DeleteObjectVersion
+                  - s3:AbortMultipartUpload
+                Resource:
+                  - !GetAtt DataBucket.Arn
+                  - !Sub '${DataBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - glue:GetJobRuns
+                  - glue:GetJobRun
+                  - glue:BatchStopJobRun
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:job/${CustomerJob}'
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:job/${TransactionJob}'
+              - Effect: Allow
+                Action:
+                  - glue:GetTables
+                  - glue:BatchDeleteTable
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${Database}'
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${Database}/*'
+              - Effect: Allow
+                Action: states:ListExecutions
+                Resource: !Ref DailyWorkflow
+              - Effect: Allow
+                Action: states:StopExecution
+                Resource: !Sub 'arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:execution:${ProjectName}-daily:*'
+              - Effect: Allow
+                Action:
+                  - athena:ListQueryExecutions
+                  - athena:GetQueryExecution
+                  - athena:StopQueryExecution
+                Resource: !Sub 'arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${AthenaWorkGroup}'
+  CleanupFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: CleanupLogs
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      FunctionName: !Sub '${ProjectName}-app-cleanup'
+      Runtime: python3.12
+      Handler: cleanup.handler
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Sub 'releases/${SourceCommit}/cleanup.zip'
+      Timeout: 900
+      MemorySize: 256
+      Role: !GetAtt CleanupRole.Arn
+  ApplicationCleanup:
+    Type: Custom::EmptyBankingData
+    DependsOn: [RepairAgent, DataBucketPolicy, EmailSubscription]
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      ServiceToken: !GetAtt CleanupFunction.Arn
+      ServiceTimeout: 950
+      Bucket: !Ref DataBucket
+      Database: !Ref Database
+      Jobs: [!Ref CustomerJob, !Ref TransactionJob]
+      StateMachineArn: !Ref DailyWorkflow
+      WorkGroup: !Ref AthenaWorkGroup
+
+Outputs:
+  DataBucketName: {Value: !Ref DataBucket}
+  StateMachineArn: {Value: !Ref DailyWorkflow}
+  DatabaseName: {Value: !Ref Database}
+  AthenaWorkGroup: {Value: !Ref AthenaWorkGroup}
+  DeployedCommit: {Value: !Ref SourceCommit}

@@ -1,0 +1,4 @@
+# CodeBuild installs this SDK for deployment and sample-data upload.
+# Glue and Lambda supply their own AWS SDK. No local installation is required.
+boto3>=1.35,<2
+
